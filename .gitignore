@@ -1,0 +1,18 @@
+# Virtual environments
+keip-env/
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test files
+a.py
+test_script.py
+
+# OS files
+.DS_Store
+*.swp
+*.swo

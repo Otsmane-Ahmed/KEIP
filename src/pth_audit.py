@@ -36,6 +36,22 @@ SAFE_PTH_FILES = {
     "pytest-cov.pth",             # pytest-cov
 }
 
+# Known safe .pth filename patterns (suffix-based)
+SAFE_PTH_PATTERNS = [
+    "-nspkg.pth",                 # namespace packages (zope, repoze, PasteScript, etc.)
+]
+
+
+def is_safe_pth(filepath):
+    """Check if a .pth file is in the whitelist (exact name or known pattern)."""
+    basename = os.path.basename(filepath)
+    if basename in SAFE_PTH_FILES:
+        return True
+    for pattern in SAFE_PTH_PATTERNS:
+        if basename.endswith(pattern):
+            return True
+    return False
+
 
 def get_site_packages_dirs():
     """Get all site-packages directories (global + active venv)."""
@@ -138,8 +154,7 @@ def audit_report(new_files, modified_files):
 
     # Check new files
     for filepath in new_files:
-        basename = os.path.basename(filepath)
-        if basename in SAFE_PTH_FILES:
+        if is_safe_pth(filepath):
             continue
         has_code, code_line = has_executable_code(filepath)
         if has_code:
@@ -157,8 +172,7 @@ def audit_report(new_files, modified_files):
 
     # Check modified files
     for filepath in modified_files:
-        basename = os.path.basename(filepath)
-        if basename in SAFE_PTH_FILES:
+        if is_safe_pth(filepath):
             continue
         has_code, code_line = has_executable_code(filepath)
         if has_code:
@@ -184,8 +198,7 @@ def scan_existing_pth_files(snapshot):
     """
     suspicious = False
     for filepath in snapshot:
-        basename = os.path.basename(filepath)
-        if basename in SAFE_PTH_FILES:
+        if is_safe_pth(filepath):
             continue
         has_code, code_line = has_executable_code(filepath)
         if has_code:
@@ -324,4 +337,5 @@ if __name__ == "__main__":
         
         ret = run_pip_with_audit(sys.argv[1:])
         sys.exit(ret)
+
 
